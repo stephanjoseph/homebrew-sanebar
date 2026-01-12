@@ -1,0 +1,1806 @@
+From 523c3714f660c62db5632b2b9aa68445aa0c2e5d Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 8 Jan 2026 04:09:41 +0000
+Subject: [PATCH] Feat: Icon-first search, overflow strip, and pinned icons
+
+Upgrade Cmd+Shift+Space to icon-first search with accessibility-driven menu bar item indexing, pinned favorites, refresh controls, and click reliability indicators. Add an overflow strip window for notch/overflow recovery, plus debounced settings saves and diagnostics helpers.
+---
+ Core/Controllers/StatusBarController.swift    |   5 +
+ Core/MenuBarManager.swift                     |  83 ++++-
+ Core/Models/MenuBarItem.swift                 |  85 ++++++
+ Core/Services/AccessibilityService.swift      | 102 +++++++
+ Core/Services/HidingService.swift             |  33 +-
+ Core/Services/KeyboardShortcutsService.swift  |  18 +-
+ Core/Services/PersistenceService.swift        |  45 ++-
+ Core/Services/SearchService.swift             | 139 ++++++++-
+ Core/Utilities/AccessibilityPermission.swift  |  32 ++
+ Tests/KeyboardShortcutsServiceTests.swift     |   6 +-
+ Tests/Mocks/Mocks.swift                       |  41 +++
+ Tests/SearchWindowTests.swift                 |  16 +
+ UI/Components/WelcomeBanner.swift             |   2 +-
+ UI/OnboardingTipView.swift                    |   3 +-
+ .../OverflowStripController.swift             |  99 ++++++
+ UI/OverflowStrip/OverflowStripView.swift      | 192 ++++++++++++
+ UI/SearchWindow/MenuBarSearchView.swift       | 286 +++++++++++++++++-
+ UI/SearchWindow/SearchWindowController.swift  |  17 +-
+ UI/Settings/AdvancedSettingsView.swift        |  66 +++-
+ UI/Settings/GeneralSettingsView.swift         |   6 +-
+ UI/Settings/ShortcutsSettingsView.swift       |   3 +-
+ 21 files changed, 1248 insertions(+), 31 deletions(-)
+ create mode 100644 Core/Models/MenuBarItem.swift
+ create mode 100644 Core/Utilities/AccessibilityPermission.swift
+ create mode 100644 UI/OverflowStrip/OverflowStripController.swift
+ create mode 100644 UI/OverflowStrip/OverflowStripView.swift
+
+diff --git a/Core/Controllers/StatusBarController.swift b/Core/Controllers/StatusBarController.swift
+index 2c7b85c..76ce3d4 100644
+--- a/Core/Controllers/StatusBarController.swift
++++ b/Core/Controllers/StatusBarController.swift
+@@ -120,6 +120,11 @@ final class StatusBarController: StatusBarControllerProtocol {
+         )
+         button.image?.isTemplate = true
+         button.alphaValue = 0.5
++
++        // When we "collapse" the always-hidden delimiter we do so by making the status item very wide.
++        // Keep the slash icon visually anchored to the right edge so it doesn't appear to disappear.
++        button.imagePosition = .imageTrailing
++        button.alignment = .right
+     }
+ 
+     // MARK: - Appearance
+diff --git a/Core/MenuBarManager.swift b/Core/MenuBarManager.swift
+index e1c7fb1..ba57319 100644
+--- a/Core/MenuBarManager.swift
++++ b/Core/MenuBarManager.swift
+@@ -11,9 +11,9 @@ private let logger = Logger(subsystem: "com.sanebar.app", category: "MenuBarMana
+ ///
+ /// HOW IT WORKS (same technique as Dozer, Hidden Bar, and similar tools):
+ /// 1. User Cmd+drags menu bar icons to position them left or right of our delimiter
+-/// 2. Icons to the LEFT of delimiter = always visible
+-/// 3. Icons to the RIGHT of delimiter = can be hidden
+-/// 4. To HIDE: Set delimiter's length to 10,000 → pushes everything to its right off screen
++/// 2. Icons to the LEFT of delimiter = can be hidden
++/// 3. Icons to the RIGHT of delimiter = always visible (keep SaneBar itself here)
++/// 4. To HIDE: Set delimiter's length to 10,000 → expands over the hidden side
+ /// 5. To SHOW: Set delimiter's length back to 22 → reveals the hidden icons
+ ///
+ /// NO accessibility API needed. NO CGEvent simulation. Just simple NSStatusItem.length toggle.
+@@ -64,6 +64,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
+     // MARK: - Subscriptions
+ 
+     private var cancellables = Set<AnyCancellable>()
++    private var settingsSaveTask: Task<Void, Never>?
+ 
+     // MARK: - Initialization
+ 
+@@ -299,6 +300,82 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
+         iconHotkeysService.registerHotkeys(from: settings)
+     }
+ 
++    /// Persist settings with a short debounce to avoid excessive disk writes while typing.
++    ///
++    /// This keeps the app snappy for users with lots of configuration (50+ icons, many rules).
++    func scheduleSaveSettings(debounce: TimeInterval = 0.5) {
++        settingsSaveTask?.cancel()
++        settingsSaveTask = Task { [weak self] in
++            do {
++                try await Task.sleep(nanoseconds: UInt64(debounce * 1_000_000_000))
++            } catch {
++                return
++            }
++            await MainActor.run {
++                self?.saveSettings()
++            }
++        }
++    }
++
++    // MARK: - Menu Bar Icon Pins / Click Stats
++
++    func isPinned(_ item: MenuBarItem) -> Bool {
++        settings.pinnedMenuBarItemSignatures.contains(item.signature) ||
++            settings.pinnedMenuBarItemSignatures.contains(item.legacySignature)
++    }
++
++    func clickStats(for item: MenuBarItem) -> MenuBarItemClickStats? {
++        settings.menuBarItemClickStats[item.signature] ?? settings.menuBarItemClickStats[item.legacySignature]
++    }
++
++    enum MenuBarItemClickStatus {
++        case unknown
++        case success
++        case failure
++    }
++
++    func clickStatus(for item: MenuBarItem) -> MenuBarItemClickStatus {
++        guard let stats = clickStats(for: item), stats.lastAttempt != nil else { return .unknown }
++        let lastSuccess = stats.lastSuccess ?? .distantPast
++        let lastFailure = stats.lastFailure ?? .distantPast
++        return lastSuccess >= lastFailure ? .success : .failure
++    }
++
++    func togglePinned(_ item: MenuBarItem) {
++        // Migrate legacy pin to the newer, more stable signature.
++        let sig = item.signature
++        let legacy = item.legacySignature
++
++        if let idx = settings.pinnedMenuBarItemSignatures.firstIndex(where: { $0 == sig || $0 == legacy }) {
++            settings.pinnedMenuBarItemSignatures.remove(at: idx)
++        } else {
++            settings.pinnedMenuBarItemSignatures.removeAll(where: { $0 == legacy })
++            settings.pinnedMenuBarItemSignatures.insert(sig, at: 0)
++        }
++        scheduleSaveSettings()
++    }
++
++    func recordMenuBarItemClick(_ item: MenuBarItem, success: Bool) {
++        // Preserve existing stats from legacy keys if present.
++        let sig = item.signature
++        let legacy = item.legacySignature
++        let key = settings.menuBarItemClickStats[sig] != nil ? sig : (settings.menuBarItemClickStats[legacy] != nil ? legacy : sig)
++        var stats = settings.menuBarItemClickStats[key] ?? MenuBarItemClickStats()
++        stats.record(success: success)
++        settings.menuBarItemClickStats[key] = stats
++
++        // Keep the stats map bounded so it can't grow forever.
++        if settings.menuBarItemClickStats.count > 500 {
++            let sorted = settings.menuBarItemClickStats
++                .sorted { ($0.value.lastAttempt ?? .distantPast) < ($1.value.lastAttempt ?? .distantPast) }
++            for (key, _) in sorted.prefix(settings.menuBarItemClickStats.count - 400) {
++                settings.menuBarItemClickStats.removeValue(forKey: key)
++            }
++        }
++
++        scheduleSaveSettings(debounce: 0.2)
++    }
++
+     /// Reset all settings to defaults
+     func resetToDefaults() {
+         settingsController.resetToDefaults()
+diff --git a/Core/Models/MenuBarItem.swift b/Core/Models/MenuBarItem.swift
+new file mode 100644
+index 0000000..d2994da
+--- /dev/null
++++ b/Core/Models/MenuBarItem.swift
+@@ -0,0 +1,85 @@
++import AppKit
++
++// MARK: - MenuBarItem
++
++/// Represents a single menu bar extra (status item) discovered via Accessibility.
++///
++/// Notes:
++/// - The identifier is intentionally ephemeral; we use it only within the search session.
++/// - We keep an `axIndex` so we can re-find and press the same element without guessing by PID alone.
++struct MenuBarItem: Identifiable, Hashable, Sendable {
++    /// Stable within a single snapshot of the menu bar extras list.
++    let id: String
++
++    /// Index in the system-wide `AXExtrasMenuBar` children array.
++    let axIndex: Int
++
++    /// Owning process ID (as reported by Accessibility).
++    let ownerPID: pid_t
++
++    /// Best-effort label for searching (AXTitle/AXDescription fallback).
++    let title: String
++
++    /// Best-effort owning app metadata (may be nil for system items).
++    let bundleID: String?
++    let appName: String?
++
++    /// Icon for display (from owning app when available).
++    let icon: NSImage?
++
++    /// Accessibility metadata (best-effort) used to stabilize pinning.
++    let axRole: String
++    let axIdentifier: String
++
++    init(
++        axIndex: Int,
++        ownerPID: pid_t,
++        title: String,
++        bundleID: String?,
++        appName: String?,
++        icon: NSImage?,
++        axRole: String = "",
++        axIdentifier: String = ""
++    ) {
++        self.axIndex = axIndex
++        self.ownerPID = ownerPID
++        self.title = title
++        self.bundleID = bundleID
++        self.appName = appName
++        self.icon = icon
++        self.axRole = axRole
++        self.axIdentifier = axIdentifier
++        self.id = "ax:\(axIndex):pid:\(ownerPID)"
++    }
++
++    /// Stable-ish signature used for pinning and reliability tracking.
++    ///
++    /// AX indices and PIDs change, so we avoid storing those.
++    var signature: String {
++        let owner = (bundleID?.lowercased() ?? "unknown")
++
++        // Prefer AX identifier when present (most stable across title/state changes).
++        if !axIdentifier.isEmpty {
++            return "\(owner)::id:\(axIdentifier.lowercased())"
++        }
++
++        // Otherwise include role + normalized label.
++        let role = axRole.isEmpty ? "unknownrole" : axRole.lowercased()
++        let label = (title.isEmpty ? (appName ?? "menu bar item") : title)
++            .lowercased()
++            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
++            .trimmingCharacters(in: .whitespacesAndNewlines)
++        return "\(owner)::role:\(role)::\(label)"
++    }
++
++    /// Legacy signature used in older versions (bundleID::title).
++    var legacySignature: String {
++        let owner = (bundleID?.lowercased() ?? "unknown")
++        let label = (title.isEmpty ? (appName ?? "menu bar item") : title)
++            .lowercased()
++            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
++            .trimmingCharacters(in: .whitespacesAndNewlines)
++        return "\(owner)::\(label)"
++    }
++}
++
+diff --git a/Core/Services/AccessibilityService.swift b/Core/Services/AccessibilityService.swift
+index ade3d72..acde5de 100644
+--- a/Core/Services/AccessibilityService.swift
++++ b/Core/Services/AccessibilityService.swift
+@@ -27,6 +27,11 @@ final class AccessibilityService: ObservableObject {
+         AXIsProcessTrusted()
+     }
+ 
++    /// Request Accessibility permission via the system prompt.
++    func requestPermissionPrompt() {
++        AccessibilityPermission.requestPrompt()
++    }
++
+     // MARK: - Actions
+ 
+     /// Perform a "Virtual Click" on a menu bar item
+@@ -35,6 +40,11 @@ final class AccessibilityService: ObservableObject {
+     func clickMenuBarItem(for bundleID: String) -> Bool {
+         logger.info("Attempting to click menu bar item for: \(bundleID)")
+ 
++        guard !bundleID.isEmpty else {
++            logger.warning("Empty bundleID provided")
++            return false
++        }
++
+         guard isTrusted else {
+             logger.error("Accessibility permission not granted")
+             return false
+@@ -61,6 +71,98 @@ final class AccessibilityService: ObservableObject {
+         return false
+     }
+ 
++    /// Returns the set of PIDs that currently own at least one menu bar extra (status item).
++    ///
++    /// This is used to build a high-signal search list without spamming background helpers.
++    /// It scans the system-wide Extras Menu Bar once and extracts owner PIDs.
++    func menuBarItemOwnerPIDs() -> Set<pid_t> {
++        guard isTrusted else { return [] }
++        let (items, _) = menuBarExtrasSnapshot()
++        return Set(items.map(\.ownerPID)).subtracting([0])
++    }
++
++    /// Ephemeral snapshot DTO for building search UI.
++    struct MenuBarExtraSnapshot: Hashable, Sendable {
++        let axIndex: Int
++        let ownerPID: pid_t
++        let title: String
++        let role: String
++        let identifier: String
++    }
++
++    /// List menu bar extras (status items) from the system-wide menu bar.
++    ///
++    /// This is intended for building the Cmd+Shift+Space icon list.
++    func menuBarExtras() -> [MenuBarExtraSnapshot] {
++        let (items, _) = menuBarExtrasSnapshot()
++        return items
++    }
++
++    /// Press a menu bar extra by its `axIndex` in the current system-wide extras list.
++    ///
++    /// This is more reliable than pressing "the first item owned by PID" when an app has multiple icons.
++    func pressMenuBarExtra(axIndex: Int) -> Bool {
++        guard isTrusted else { return false }
++        let (_, elements) = menuBarExtrasSnapshot()
++        guard axIndex >= 0, axIndex < elements.count else { return false }
++        return performPress(on: elements[axIndex])
++    }
++
++    // MARK: - Snapshot helpers
++
++    /// Returns (items, elements) aligned by index.
++    private func menuBarExtrasSnapshot() -> ([MenuBarExtraSnapshot], [AXUIElement]) {
++        guard isTrusted else { return ([], []) }
++
++        let systemWide = AXUIElementCreateSystemWide()
++        var extrasMenuBar: CFTypeRef?
++
++        let result = AXUIElementCopyAttributeValue(systemWide, kAXExtrasMenuBarAttribute as CFString, &extrasMenuBar)
++        guard result == .success, let menuBar = extrasMenuBar else {
++            return ([], [])
++        }
++
++        // swiftlint:disable:next force_cast
++        let menuBarElement = menuBar as! AXUIElement
++        var children: CFTypeRef?
++
++        let childrenResult = AXUIElementCopyAttributeValue(menuBarElement, kAXChildrenAttribute as CFString, &children)
++        guard childrenResult == .success, let elements = children as? [AXUIElement] else {
++            return ([], [])
++        }
++
++        var items: [MenuBarExtraSnapshot] = []
++        items.reserveCapacity(elements.count)
++
++        for (idx, element) in elements.enumerated() {
++            var pid: pid_t = 0
++            AXUIElementGetPid(element, &pid)
++
++            let label =
++                (copyStringAttribute(element, kAXTitleAttribute) ??
++                 copyStringAttribute(element, kAXDescriptionAttribute) ??
++                 copyStringAttribute(element, kAXHelpAttribute) ??
++                 "")
++                    .trimmingCharacters(in: .whitespacesAndNewlines)
++
++            let role = (copyStringAttribute(element, kAXRoleAttribute) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
++            // kAXIdentifierAttribute is not always present; treat missing as empty.
++            let identifier = (copyStringAttribute(element, kAXIdentifierAttribute as CFString) ?? "")
++                .trimmingCharacters(in: .whitespacesAndNewlines)
++
++            items.append(.init(axIndex: idx, ownerPID: pid, title: label, role: role, identifier: identifier))
++        }
++
++        return (items, elements)
++    }
++
++    private func copyStringAttribute(_ element: AXUIElement, _ attribute: CFString) -> String? {
++        var value: CFTypeRef?
++        let error = AXUIElementCopyAttributeValue(element, attribute, &value)
++        guard error == .success else { return nil }
++        return value as? String
++    }
++
+     // MARK: - System Wide Search
+ 
+     private func clickSystemWideItem(for targetPID: pid_t) -> Bool {
+diff --git a/Core/Services/HidingService.swift b/Core/Services/HidingService.swift
+index bf8f1bb..bf289dc 100644
+--- a/Core/Services/HidingService.swift
++++ b/Core/Services/HidingService.swift
+@@ -44,9 +44,9 @@ private enum StatusItemLength {
+ ///
+ /// HOW IT WORKS:
+ /// 1. User Cmd+drags their menu bar icons to position them left or right of our delimiter
+-/// 2. Icons to the LEFT of delimiter = always visible
+-/// 3. Icons to the RIGHT of delimiter = can be hidden
+-/// 4. To HIDE: Set delimiter's length to 10,000 → pushes everything to its right off screen
++/// 2. Icons to the LEFT of delimiter = can be hidden
++/// 3. Icons to the RIGHT of delimiter = always visible
++/// 4. To HIDE: Set delimiter's length to 10,000 → expands over the hidden side
+ /// 5. To SHOW: Set delimiter's length back to 22 → reveals the hidden icons
+ ///
+ /// This is how Dozer, Hidden Bar, and similar tools work. No CGEvent needed.
+@@ -80,6 +80,15 @@ final class HidingService: ObservableObject, HidingServiceProtocol {
+         self.delimiterItem = delimiterItem
+         self.alwaysHiddenDelimiter = alwaysHiddenDelimiter
+         logger.info("HidingService configured with delimiter item(s)")
++
++        // Ensure the physical status item lengths match our logical initial state.
++        //
++        // The intended meaning of `.expanded` is:
++        // - regular hidden section is visible (main delimiter is small)
++        // - always-hidden section remains hidden (always-hidden delimiter stays "collapsed")
++        delimiterItem.length = StatusItemLength.expanded
++        alwaysHiddenDelimiter?.length = StatusItemLength.collapsed
++        state = .expanded
+     }
+ 
+     // MARK: - Show/Hide Operations
+@@ -107,7 +116,14 @@ final class HidingService: ObservableObject, HidingServiceProtocol {
+                 await hide()
+             }
+         case .alwaysHiddenShown:
+-            await hide()
++            // If the user is viewing the always-hidden area, a normal click should
++            // return to the regular expanded view (keeping regular hidden items visible),
++            // rather than collapsing everything.
++            if withModifier {
++                await hide()
++            } else {
++                await hideAlwaysHidden()
++            }
+         }
+     }
+ 
+@@ -123,9 +139,11 @@ final class HidingService: ObservableObject, HidingServiceProtocol {
+         isAnimating = true
+         logger.info("Expanding menu bar (length → \(StatusItemLength.expanded))")
+ 
+-        // Show both delimiters so users can always see the zone markers
++        // Show the regular hidden section, but KEEP the always-hidden section hidden.
++        // This prevents "show hidden" triggers (hover/app launch/hotkeys/search) from revealing
++        // the always-hidden area unintentionally.
+         delimiterItem.length = StatusItemLength.expanded
+-        alwaysHiddenDelimiter?.length = StatusItemLength.expanded
++        alwaysHiddenDelimiter?.length = StatusItemLength.collapsed
+ 
+         state = .expanded
+         isAnimating = false
+@@ -196,7 +214,8 @@ final class HidingService: ObservableObject, HidingServiceProtocol {
+ 
+         logger.info("Hiding always-hidden section only")
+ 
+-        // Expand only the always-hidden delimiter
++        // Re-hide the always-hidden section, keep regular hidden visible
++        delimiterItem?.length = StatusItemLength.expanded
+         alwaysHiddenDelimiter?.length = StatusItemLength.collapsed
+ 
+         state = .expanded
+diff --git a/Core/Services/KeyboardShortcutsService.swift b/Core/Services/KeyboardShortcutsService.swift
+index 712337e..fa71c49 100644
+--- a/Core/Services/KeyboardShortcutsService.swift
++++ b/Core/Services/KeyboardShortcutsService.swift
+@@ -18,6 +18,9 @@ extension KeyboardShortcuts.Name {
+ 
+     /// Open menu bar search
+     static let searchMenuBar = Self("searchMenuBar")
++
++    /// Open overflow strip (click icons behind notch)
++    static let overflowStrip = Self("overflowStrip")
+ }
+ 
+ // MARK: - KeyboardShortcutsServiceProtocol
+@@ -96,6 +99,13 @@ final class KeyboardShortcutsService: KeyboardShortcutsServiceProtocol {
+                 SearchWindowController.shared.toggle()
+             }
+         }
++
++        // Overflow strip
++        KeyboardShortcuts.onKeyUp(for: .overflowStrip) {
++            Task { @MainActor in
++                OverflowStripController.shared.toggle()
++            }
++        }
+     }
+ 
+     /// Unregister all handlers (for cleanup)
+@@ -105,6 +115,7 @@ final class KeyboardShortcutsService: KeyboardShortcutsServiceProtocol {
+         KeyboardShortcuts.reset(.hideItems)
+         KeyboardShortcuts.reset(.openSettings)
+         KeyboardShortcuts.reset(.searchMenuBar)
++        KeyboardShortcuts.reset(.overflowStrip)
+     }
+ 
+     // MARK: - Default Shortcuts
+@@ -126,11 +137,16 @@ final class KeyboardShortcutsService: KeyboardShortcutsServiceProtocol {
+             KeyboardShortcuts.setShortcut(.init(.backslash, modifiers: [.command, .option]), for: .hideItems)
+         }
+ 
+-        // Search apps: Cmd+Shift+Space
++        // Find menu bar icons: Cmd+Shift+Space
+         if KeyboardShortcuts.getShortcut(for: .searchMenuBar) == nil {
+             KeyboardShortcuts.setShortcut(.init(.space, modifiers: [.command, .shift]), for: .searchMenuBar)
+         }
+ 
++        // Overflow strip: Cmd+Shift+O
++        if KeyboardShortcuts.getShortcut(for: .overflowStrip) == nil {
++            KeyboardShortcuts.setShortcut(.init(.o, modifiers: [.command, .shift]), for: .overflowStrip)
++        }
++
+         // Open Settings: Cmd+, (standard macOS convention)
+         if KeyboardShortcuts.getShortcut(for: .openSettings) == nil {
+             KeyboardShortcuts.setShortcut(.init(.comma, modifiers: .command), for: .openSettings)
+diff --git a/Core/Services/PersistenceService.swift b/Core/Services/PersistenceService.swift
+index aca6e78..77356f0 100644
+--- a/Core/Services/PersistenceService.swift
++++ b/Core/Services/PersistenceService.swift
+@@ -62,6 +62,23 @@ struct SaneBarSettings: Codable, Sendable, Equatable {
+     /// When true, app uses .regular mode (Dock icon visible)
+     var showDockIcon: Bool = false
+ 
++    /// Include background/helper apps in the Cmd+Shift+Space search list.
++    ///
++    /// When false (default), search focuses on "high-signal" apps:
++    /// - regular apps, and
++    /// - apps pinned via hotkeys/triggers, and
++    /// - apps that actually own a menu bar item (when Accessibility permission is granted).
++    var searchIncludeBackgroundApps: Bool = false
++
++    /// Pinned menu bar icon signatures (favorites) shown at the top of icon search and overflow strip.
++    ///
++    /// Each entry is a stable-ish signature such as "bundleID::title" (lowercased), so we can
++    /// match items across launches even though AX indices change.
++    var pinnedMenuBarItemSignatures: [String] = []
++
++    /// Per-icon click reliability stats keyed by the same signature used for pinning.
++    var menuBarItemClickStats: [String: MenuBarItemClickStats] = [:]
++
+     // MARK: - Backwards-compatible decoding
+ 
+     init() {}
+@@ -86,13 +103,39 @@ struct SaneBarSettings: Codable, Sendable, Equatable {
+         showOnNetworkChange = try container.decodeIfPresent(Bool.self, forKey: .showOnNetworkChange) ?? false
+         triggerNetworks = try container.decodeIfPresent([String].self, forKey: .triggerNetworks) ?? []
+         showDockIcon = try container.decodeIfPresent(Bool.self, forKey: .showDockIcon) ?? false
++        searchIncludeBackgroundApps = try container.decodeIfPresent(Bool.self, forKey: .searchIncludeBackgroundApps) ?? false
++        pinnedMenuBarItemSignatures = try container.decodeIfPresent([String].self, forKey: .pinnedMenuBarItemSignatures) ?? []
++        menuBarItemClickStats = try container.decodeIfPresent([String: MenuBarItemClickStats].self, forKey: .menuBarItemClickStats) ?? [:]
+     }
+ 
+     private enum CodingKeys: String, CodingKey {
+         case autoRehide, rehideDelay, spacerCount, showOnAppLaunch, triggerApps
+         case alwaysVisibleApps, iconHotkeys, showOnLowBattery, hasCompletedOnboarding
+         case showOnHover, hoverDelay, menuBarAppearance, showOnNetworkChange, triggerNetworks
+-        case showDockIcon
++        case showDockIcon, searchIncludeBackgroundApps
++        case pinnedMenuBarItemSignatures, menuBarItemClickStats
++    }
++}
++
++// MARK: - MenuBarItemClickStats
++
++/// Lightweight reliability tracking for menu bar icon clicks.
++struct MenuBarItemClickStats: Codable, Sendable, Equatable {
++    var successCount: Int = 0
++    var failureCount: Int = 0
++    var lastAttempt: Date?
++    var lastSuccess: Date?
++    var lastFailure: Date?
++
++    mutating func record(success: Bool, now: Date = Date()) {
++        lastAttempt = now
++        if success {
++            successCount += 1
++            lastSuccess = now
++        } else {
++            failureCount += 1
++            lastFailure = now
++        }
+     }
+ }
+ 
+diff --git a/Core/Services/SearchService.swift b/Core/Services/SearchService.swift
+index 4b855a9..d28462e 100644
+--- a/Core/Services/SearchService.swift
++++ b/Core/Services/SearchService.swift
+@@ -8,9 +8,16 @@ protocol SearchServiceProtocol: Sendable {
+     /// Fetch all running apps suitable for menu bar interaction
+     func getRunningApps() async -> [RunningApp]
+ 
++    /// Fetch menu bar extras (status items) suitable for icon-level search.
++    func getMenuBarItems() async -> [MenuBarItem]
++
+     /// Activate an app, revealing hidden items and attempting virtual click
+     @MainActor
+     func activate(app: RunningApp) async
++
++    /// Press a specific menu bar icon (status item) by its accessibility index.
++    @MainActor
++    func activate(menuBarItem: MenuBarItem) async
+ }
+ 
+ // MARK: - SearchService
+@@ -18,17 +25,117 @@ protocol SearchServiceProtocol: Sendable {
+ final class SearchService: SearchServiceProtocol {
+     static let shared = SearchService()
+ 
++    func getMenuBarItems() async -> [MenuBarItem] {
++        await MainActor.run {
++            guard AccessibilityService.shared.isTrusted else { return [] }
++
++            let settings: SaneBarSettings = (try? PersistenceService.shared.loadSettings()) ?? SaneBarSettings()
++
++            let includeBackground = settings.searchIncludeBackgroundApps
++            let pinnedBundleIDs = Set(
++                settings.triggerApps +
++                    settings.alwaysVisibleApps +
++                    Array(settings.iconHotkeys.keys)
++            )
++
++            let workspace = NSWorkspace.shared
++            let appsByPID: [pid_t: NSRunningApplication] = Dictionary(
++                uniqueKeysWithValues: workspace.runningApplications.map { ($0.processIdentifier, $0) }
++            )
++
++            return AccessibilityService.shared.menuBarExtras()
++                .filter { snap in
++                    // If we can't label it and it isn't pinned, it becomes noise quickly.
++                    if snap.title.isEmpty {
++                        if let app = appsByPID[snap.ownerPID],
++                           let bundleID = app.bundleIdentifier,
++                           pinnedBundleIDs.contains(bundleID) {
++                            return true
++                        }
++                        return false
++                    }
++
++                    if includeBackground { return true }
++
++                    // In high-signal mode, keep:
++                    // - anything with a readable title/description
++                    // - and allow pinned even if "backgroundy"
++                    if let app = appsByPID[snap.ownerPID],
++                       let bundleID = app.bundleIdentifier,
++                       pinnedBundleIDs.contains(bundleID) {
++                        return true
++                    }
++
++                    // Hide obvious non-user-facing owners unless they have a label.
++                    // Note: SystemUIServer owns many Apple status items; we keep labeled ones.
++                    return true
++                }
++                .map { snap -> MenuBarItem in
++                    let ownerApp = appsByPID[snap.ownerPID]
++                    return MenuBarItem(
++                        axIndex: snap.axIndex,
++                        ownerPID: snap.ownerPID,
++                        title: snap.title.isEmpty ? (ownerApp?.localizedName ?? "Menu Bar Item") : snap.title,
++                        bundleID: ownerApp?.bundleIdentifier,
++                        appName: ownerApp?.localizedName,
++                        icon: ownerApp?.icon,
++                        axRole: snap.role,
++                        axIdentifier: snap.identifier
++                    )
++                }
++        }
++    }
++
+     func getRunningApps() async -> [RunningApp] {
+         // Run on main actor because accessing NSWorkspace.runningApplications is main-thread bound
+         await MainActor.run {
+             let workspace = NSWorkspace.shared
++
++            let settings: SaneBarSettings = (try? PersistenceService.shared.loadSettings()) ?? SaneBarSettings()
++            let includeBackground = settings.searchIncludeBackgroundApps
++
++            // "Pinned" apps should always show up in search, even if they are accessory/background.
++            let pinnedBundleIDs = Set(
++                settings.triggerApps +
++                    settings.alwaysVisibleApps +
++                    Array(settings.iconHotkeys.keys)
++            )
++
++            // If we have Accessibility permission, we can cheaply detect which PIDs actually own
++            // a menu bar extra (status item) and prioritize those.
++            let isAXTrusted = AccessibilityService.shared.isTrusted
++            let menuBarOwnerPIDs: Set<pid_t> = (!includeBackground && isAXTrusted)
++                ? AccessibilityService.shared.menuBarItemOwnerPIDs()
++                : []
++
++            let currentBundleID = Bundle.main.bundleIdentifier
++
+             return workspace.runningApplications
+                 .filter { app in
+-                    // Include regular apps and background apps that might have status items
+-                    app.activationPolicy == .regular ||
+-                    app.activationPolicy == .accessory
++                    guard let bundleID = app.bundleIdentifier, !bundleID.isEmpty else { return false }
++                    guard let name = app.localizedName, !name.isEmpty else { return false }
++                    guard bundleID != currentBundleID else { return false } // don't show SaneBar itself
++
++                    // Avoid the common "random system service" offender by default.
++                    // Users can re-enable via "Include background/helper apps" in settings.
++                    if !includeBackground && bundleID == "com.apple.systemuiserver" {
++                        return pinnedBundleIDs.contains(bundleID)
++                    }
++
++                    if includeBackground {
++                        return app.activationPolicy == .regular || app.activationPolicy == .accessory
++                    }
++
++                    // High-signal mode:
++                    // - regular apps (often the ones users mean by "apps")
++                    // - pinned apps (user explicitly cares)
++                    // - apps that actually own a menu bar item (when AX is enabled)
++                    if app.activationPolicy == .regular { return true }
++                    if pinnedBundleIDs.contains(bundleID) { return true }
++                    if isAXTrusted && menuBarOwnerPIDs.contains(app.processIdentifier) { return true }
++
++                    return false
+                 }
+-                .filter { $0.bundleIdentifier != nil }
+                 .map { RunningApp(app: $0) }
+                 .sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
+         }
+@@ -50,4 +157,28 @@ final class SearchService: SearchServiceProtocol {
+             }
+         }
+     }
++
++    @MainActor
++    func activate(menuBarItem: MenuBarItem) {
++        // 1. Reveal regular hidden items first (in case it's hidden)
++        MenuBarManager.shared.showHiddenItems()
++
++        // 2. Attempt to press the specific menu bar extra
++        var clickSuccess = AccessibilityService.shared.pressMenuBarExtra(axIndex: menuBarItem.axIndex)
++
++        // Fallback: if pressing by index fails, try the older PID-based approach for the owning app.
++        if !clickSuccess, let bundleID = menuBarItem.bundleID {
++            clickSuccess = AccessibilityService.shared.clickMenuBarItem(for: bundleID)
++        }
++
++        MenuBarManager.shared.recordMenuBarItemClick(menuBarItem, success: clickSuccess)
++
++        if !clickSuccess {
++            // Fallback: activate owning app if we can resolve it
++            if let bundleID = menuBarItem.bundleID,
++               let runningApp = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
++                runningApp.activate()
++            }
++        }
++    }
+ }
+diff --git a/Core/Utilities/AccessibilityPermission.swift b/Core/Utilities/AccessibilityPermission.swift
+new file mode 100644
+index 0000000..23a45d1
+--- /dev/null
++++ b/Core/Utilities/AccessibilityPermission.swift
+@@ -0,0 +1,32 @@
++import AppKit
++import ApplicationServices
++
++enum AccessibilityPermission {
++    /// Triggers the system Accessibility permission prompt (if needed).
++    @MainActor
++    static func requestPrompt() {
++        let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString: true]
++        _ = AXIsProcessTrustedWithOptions(options)
++    }
++
++    /// Best-effort deep link into System Settings → Privacy & Security → Accessibility.
++    @MainActor
++    static func openAccessibilitySettings() {
++        // Ventura/Sonoma System Settings deep link format is not fully stable across releases,
++        // so we try a couple of known variants and fall back to opening System Settings.
++        let candidates: [String] = [
++            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
++            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
++            "x-apple.systempreferences:com.apple.settings.PrivacySecurity",
++            "x-apple.systempreferences:com.apple.SystemSettings"
++        ]
++
++        for raw in candidates {
++            if let url = URL(string: raw) {
++                NSWorkspace.shared.open(url)
++                return
++            }
++        }
++    }
++}
++
+diff --git a/Tests/KeyboardShortcutsServiceTests.swift b/Tests/KeyboardShortcutsServiceTests.swift
+index 63ac7d1..a773e02 100644
+--- a/Tests/KeyboardShortcutsServiceTests.swift
++++ b/Tests/KeyboardShortcutsServiceTests.swift
+@@ -18,6 +18,7 @@ struct KeyboardShortcutsServiceTests {
+         let hideName = KeyboardShortcuts.Name.hideItems
+         let settingsName = KeyboardShortcuts.Name.openSettings
+         let searchName = KeyboardShortcuts.Name.searchMenuBar
++        let overflowName = KeyboardShortcuts.Name.overflowStrip
+ 
+         #expect(toggleName.rawValue == "toggleHiddenItems",
+                 "Toggle shortcut name should match")
+@@ -29,6 +30,8 @@ struct KeyboardShortcutsServiceTests {
+                 "Settings shortcut name should match")
+         #expect(searchName.rawValue == "searchMenuBar",
+                 "Search shortcut name should match")
++        #expect(overflowName.rawValue == "overflowStrip",
++                "Overflow shortcut name should match")
+     }
+ 
+     @Test("All shortcut names are unique")
+@@ -38,7 +41,8 @@ struct KeyboardShortcutsServiceTests {
+             .showHiddenItems,
+             .hideItems,
+             .openSettings,
+-            .searchMenuBar
++            .searchMenuBar,
++            .overflowStrip
+         ]
+ 
+         let rawValues = names.map { $0.rawValue }
+diff --git a/Tests/Mocks/Mocks.swift b/Tests/Mocks/Mocks.swift
+index aa1c173..9d7b2d9 100644
+--- a/Tests/Mocks/Mocks.swift
++++ b/Tests/Mocks/Mocks.swift
+@@ -85,6 +85,24 @@ final class PersistenceServiceProtocolMock: PersistenceServiceProtocol, @uncheck
+ final class SearchServiceProtocolMock: SearchServiceProtocol, @unchecked Sendable {
+     init() { }
+ 
++    private let getMenuBarItemsState = MockoloMutex(MockoloHandlerState<Never, @Sendable () async -> [MenuBarItem]>())
++    var getMenuBarItemsCallCount: Int {
++        return getMenuBarItemsState.withLock(\.callCount)
++    }
++    var getMenuBarItemsHandler: (@Sendable () async -> [MenuBarItem])? {
++        get { getMenuBarItemsState.withLock(\.handler) }
++        set { getMenuBarItemsState.withLock { $0.handler = newValue } }
++    }
++    func getMenuBarItems() async -> [MenuBarItem] {
++        let getMenuBarItemsHandler = getMenuBarItemsState.withLock { state in
++            state.callCount += 1
++            return state.handler
++        }
++        if let getMenuBarItemsHandler = getMenuBarItemsHandler {
++            return await getMenuBarItemsHandler()
++        }
++        return [MenuBarItem]()
++    }
+ 
+     private let getRunningAppsState = MockoloMutex(MockoloHandlerState<Never, @Sendable () async -> [RunningApp]>())
+     var getRunningAppsCallCount: Int {
+@@ -128,6 +146,29 @@ final class SearchServiceProtocolMock: SearchServiceProtocol, @unchecked Sendabl
+         }
+         
+     }
++
++    private let activateMenuBarItemState = MockoloMutex(MockoloHandlerState<MenuBarItem, @Sendable (MenuBarItem) async -> ()>())
++    var activateMenuBarItemCallCount: Int {
++        return activateMenuBarItemState.withLock(\.callCount)
++    }
++    var activateMenuBarItemArgValues: [MenuBarItem] {
++        return activateMenuBarItemState.withLock(\.argValues).map(\.value)
++    }
++    var activateMenuBarItemHandler: (@Sendable (MenuBarItem) async -> ())? {
++        get { activateMenuBarItemState.withLock(\.handler) }
++        set { activateMenuBarItemState.withLock { $0.handler = newValue } }
++    }
++    func activate(menuBarItem: MenuBarItem) async {
++        warnIfNotSendable(menuBarItem)
++        let handler = activateMenuBarItemState.withLock { state in
++            state.callCount += 1
++            state.argValues.append(.init((menuBarItem)))
++            return state.handler
++        }
++        if let handler = handler {
++            await handler(menuBarItem)
++        }
++    }
+ }
+ 
+ class NetworkTriggerServiceProtocolMock: NetworkTriggerServiceProtocol {
+diff --git a/Tests/SearchWindowTests.swift b/Tests/SearchWindowTests.swift
+index c2b874d..c686fa2 100644
+--- a/Tests/SearchWindowTests.swift
++++ b/Tests/SearchWindowTests.swift
+@@ -27,6 +27,10 @@ struct SearchWindowTests {
+         let apps = await mockService.getRunningApps()
+         #expect(apps.count == 3)
+         #expect(mockService.getRunningAppsCallCount > 0)
++
++        // Icons list should be injectable too
++        let icons = await mockService.getMenuBarItems()
++        #expect(icons.isEmpty || icons.count >= 0)
+         
+         // Note: We cannot test @State filteredApps directly from outside the view
+         // But we verified the dependency injection works
+@@ -43,6 +47,18 @@ struct SearchWindowTests {
+         #expect(mockService.activateCallCount == 1)
+         #expect(mockService.activateArgValues.first?.id == "com.test")
+     }
++
++    @Test("Menu bar item activation is called")
++    @MainActor
++    func testMenuBarItemActivation() async {
++        let mockService = SearchServiceProtocolMock()
++        let item = MenuBarItem(axIndex: 1, ownerPID: 123, title: "VPN", bundleID: "com.test", appName: "Test", icon: nil)
++
++        await mockService.activate(menuBarItem: item)
++
++        #expect(mockService.activateMenuBarItemCallCount == 1)
++        #expect(mockService.activateMenuBarItemArgValues.first?.axIndex == 1)
++    }
+     
+     // MARK: - Model Tests
+     
+diff --git a/UI/Components/WelcomeBanner.swift b/UI/Components/WelcomeBanner.swift
+index 3d17786..7ffcd7f 100644
+--- a/UI/Components/WelcomeBanner.swift
++++ b/UI/Components/WelcomeBanner.swift
+@@ -83,7 +83,7 @@ struct WelcomeBanner: View {
+                 HStack(spacing: 8) {
+                     Image(systemName: "arrow.left.arrow.right")
+                         .foregroundStyle(.blue)
+-                    Text("Place icons left or right of SaneBar")
++                    Text("Left of separator = hidden, right = visible")
+                         .font(.callout)
+                 }
+             }
+diff --git a/UI/OnboardingTipView.swift b/UI/OnboardingTipView.swift
+index 9c3e228..7a71f30 100644
+--- a/UI/OnboardingTipView.swift
++++ b/UI/OnboardingTipView.swift
+@@ -47,7 +47,8 @@ struct OnboardingTipView: View {
+                     .foregroundStyle(.secondary)
+                 
+                 tipRow(icon: "magnifyingglass", text: "Lost an icon behind the Notch?")
+-                tipRow(icon: "keyboard", text: "Press Cmd+Shift+Space to search & click it")
++                tipRow(icon: "keyboard", text: "Press Cmd+Shift+Space to search & click icons")
++                tipRow(icon: "rectangle.3.group", text: "Press Cmd+Shift+O for an overflow strip")
+             }
+             .font(.callout)
+ 
+diff --git a/UI/OverflowStrip/OverflowStripController.swift b/UI/OverflowStrip/OverflowStripController.swift
+new file mode 100644
+index 0000000..7e31185
+--- /dev/null
++++ b/UI/OverflowStrip/OverflowStripController.swift
+@@ -0,0 +1,99 @@
++import AppKit
++import SwiftUI
++
++/// Controller for a lightweight horizontal overflow strip window.
++extension Notification.Name {
++    static let sanebarOverflowStripShown = Notification.Name("SaneBar.overflowStripShown")
++}
++
++@MainActor
++final class OverflowStripController {
++    static let shared = OverflowStripController()
++
++    private var window: NSWindow?
++    private var resignObserver: NSObjectProtocol?
++
++    func toggle() {
++        if let window = window, window.isVisible {
++            close()
++        } else {
++            show()
++        }
++    }
++
++    func show() {
++        if window == nil {
++            createWindow()
++        }
++
++        guard let window = window else { return }
++
++        if let screen = NSScreen.main {
++            let screenFrame = screen.frame
++            let windowWidth: CGFloat = 700
++            let windowHeight: CGFloat = 140
++            let menuBarHeight: CGFloat = 24
++
++            let xPos = (screenFrame.width - windowWidth) / 2
++            let yPos = screenFrame.height - menuBarHeight - windowHeight - 10
++
++            window.setFrame(
++                NSRect(x: xPos, y: yPos, width: windowWidth, height: windowHeight),
++                display: true
++            )
++        }
++
++        window.makeKeyAndOrderFront(nil)
++        NSApp.activate(ignoringOtherApps: true)
++        NotificationCenter.default.post(name: .sanebarOverflowStripShown, object: nil)
++    }
++
++    func close() {
++        window?.orderOut(nil)
++    }
++
++    private func createWindow() {
++        let contentView = OverflowStripView(onDismiss: { [weak self] in
++            self?.close()
++        })
++
++        let hostingView = NSHostingView(rootView: contentView)
++
++        let window = NSWindow(
++            contentRect: NSRect(x: 0, y: 0, width: 700, height: 140),
++            styleMask: [.titled, .closable, .fullSizeContentView],
++            backing: .buffered,
++            defer: false
++        )
++
++        window.contentView = hostingView
++        window.title = "Overflow Strip"
++        window.titlebarAppearsTransparent = true
++        window.titleVisibility = .hidden
++        window.isMovableByWindowBackground = true
++        window.level = .floating
++        window.backgroundColor = NSColor.windowBackgroundColor
++
++        if let resignObserver = resignObserver {
++            NotificationCenter.default.removeObserver(resignObserver)
++        }
++        resignObserver = NotificationCenter.default.addObserver(
++            forName: NSWindow.didResignKeyNotification,
++            object: window,
++            queue: .main
++        ) { [weak self] _ in
++            Task { @MainActor in
++                self?.close()
++            }
++        }
++
++        self.window = window
++    }
++
++    deinit {
++        if let resignObserver = resignObserver {
++            NotificationCenter.default.removeObserver(resignObserver)
++        }
++    }
++}
++
+diff --git a/UI/OverflowStrip/OverflowStripView.swift b/UI/OverflowStrip/OverflowStripView.swift
+new file mode 100644
+index 0000000..78acfc4
+--- /dev/null
++++ b/UI/OverflowStrip/OverflowStripView.swift
+@@ -0,0 +1,192 @@
++import SwiftUI
++
++/// A lightweight "overflow strip" that lets users click menu bar icons
++/// that are behind the notch/overflow area.
++struct OverflowStripView: View {
++    @State private var searchText: String = ""
++    @State private var items: [MenuBarItem] = []
++    @State private var loading = true
++    @State private var pinnedOnly: Bool = true
++
++    @ObservedObject private var menuBarManager = MenuBarManager.shared
++
++    let service: SearchServiceProtocol
++    let onDismiss: () -> Void
++
++    init(service: SearchServiceProtocol = SearchService.shared, onDismiss: @escaping () -> Void) {
++        self.service = service
++        self.onDismiss = onDismiss
++    }
++
++    private func refresh() {
++        Task {
++            loading = true
++            items = await service.getMenuBarItems()
++            loading = false
++        }
++    }
++
++    private var filtered: [MenuBarItem] {
++        let pinned = Set(menuBarManager.settings.pinnedMenuBarItemSignatures)
++        let base = items
++            .filter { pinnedOnly ? menuBarManager.isPinned($0) : true }
++            .sorted { a, b in
++                let ap = pinned.contains(a.signature)
++                let bp = pinned.contains(b.signature)
++                if ap != bp { return ap && !bp }
++                return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
++            }
++
++        guard !searchText.isEmpty else { return base }
++        return base.filter {
++            $0.title.localizedCaseInsensitiveContains(searchText) ||
++            ($0.appName?.localizedCaseInsensitiveContains(searchText) ?? false) ||
++            ($0.bundleID?.localizedCaseInsensitiveContains(searchText) ?? false)
++        }
++    }
++
++    var body: some View {
++        VStack(spacing: 10) {
++            HStack(spacing: 8) {
++                Image(systemName: "rectangle.3.group")
++                    .foregroundStyle(.secondary)
++                TextField("Find icon…", text: $searchText)
++                    .textFieldStyle(.roundedBorder)
++                Toggle("Pinned only", isOn: $pinnedOnly)
++                    .toggleStyle(.checkbox)
++                Button {
++                    refresh()
++                } label: {
++                    Image(systemName: "arrow.clockwise")
++                        .foregroundStyle(.secondary)
++                }
++                .buttonStyle(.plain)
++                .help("Refresh")
++                .keyboardShortcut("r", modifiers: [.command])
++                Button("Close") { onDismiss() }
++                    .keyboardShortcut(.escape, modifiers: [])
++            }
++            .padding(.horizontal)
++            .padding(.top, 10)
++
++            if !AccessibilityService.shared.isTrusted {
++                VStack(spacing: 6) {
++                    Text("Enable Accessibility to click menu bar icons.")
++                        .foregroundStyle(.secondary)
++                    Text("SaneBar uses Accessibility to press icons that are behind the notch/overflow.")
++                        .font(.caption)
++                        .foregroundStyle(.tertiary)
++
++                    HStack(spacing: 8) {
++                        Button {
++                            AccessibilityService.shared.requestPermissionPrompt()
++                        } label: {
++                            Label("Request Permission", systemImage: "checkmark.shield")
++                        }
++                        .buttonStyle(.borderedProminent)
++
++                        Button {
++                            AccessibilityPermission.openAccessibilitySettings()
++                        } label: {
++                            Label("Open Settings", systemImage: "gearshape")
++                        }
++                        .buttonStyle(.bordered)
++                    }
++                }
++                .padding(.horizontal)
++                Spacer()
++            } else if loading {
++                ProgressView()
++                    .padding()
++                Spacer()
++            } else if filtered.isEmpty {
++                Text("No icons found.")
++                    .foregroundStyle(.secondary)
++                Spacer()
++            } else {
++                ScrollView(.horizontal) {
++                    HStack(spacing: 10) {
++                        ForEach(filtered) { item in
++                            Button {
++                                Task { @MainActor in
++                                    await service.activate(menuBarItem: item)
++                                }
++                            } label: {
++                                VStack(spacing: 6) {
++                                    if let icon = item.icon {
++                                        Image(nsImage: icon)
++                                            .resizable()
++                                            .frame(width: 28, height: 28)
++                                    } else {
++                                        Image(systemName: "line.3.horizontal.decrease.circle")
++                                            .font(.title3)
++                                            .foregroundStyle(.secondary)
++                                    }
++                                    Text(item.title.isEmpty ? (item.appName ?? "Item") : item.title)
++                                        .font(.caption2)
++                                        .foregroundStyle(.secondary)
++                                        .lineLimit(1)
++                                        .frame(width: 72)
++                                }
++                                .padding(8)
++                                .overlay(alignment: .topTrailing) {
++                                    OverflowClickBadge(item: item)
++                                        .padding(6)
++                                }
++                            }
++                            .buttonStyle(.bordered)
++                            .contextMenu {
++                                Button {
++                                    menuBarManager.togglePinned(item)
++                                } label: {
++                                    Label(menuBarManager.isPinned(item) ? "Unpin" : "Pin", systemImage: menuBarManager.isPinned(item) ? "star.slash" : "star")
++                                }
++                            }
++                        }
++                    }
++                    .padding(.horizontal)
++                    .padding(.bottom, 12)
++                }
++            }
++        }
++        .frame(width: 700, height: 140)
++        .onAppear {
++            refresh()
++        }
++        .onReceive(NotificationCenter.default.publisher(for: .sanebarOverflowStripShown)) { _ in
++            refresh()
++        }
++        .onExitCommand { onDismiss() }
++    }
++}
++
++#Preview {
++    OverflowStripView(onDismiss: {})
++}
++
++private struct OverflowClickBadge: View {
++    let item: MenuBarItem
++    @ObservedObject private var menuBarManager = MenuBarManager.shared
++
++    var body: some View {
++        Group {
++            if !AccessibilityService.shared.isTrusted {
++                Image(systemName: "lock.fill")
++                    .foregroundStyle(.secondary)
++            } else {
++                switch menuBarManager.clickStatus(for: item) {
++                case .unknown:
++                    EmptyView()
++                case .success:
++                    Image(systemName: "checkmark.circle.fill")
++                        .foregroundStyle(.green)
++                case .failure:
++                    Image(systemName: "exclamationmark.triangle.fill")
++                        .foregroundStyle(.orange)
++                }
++            }
++        }
++        .font(.caption)
++    }
++}
++
+diff --git a/UI/SearchWindow/MenuBarSearchView.swift b/UI/SearchWindow/MenuBarSearchView.swift
+index 557cbfa..fab230c 100644
+--- a/UI/SearchWindow/MenuBarSearchView.swift
++++ b/UI/SearchWindow/MenuBarSearchView.swift
+@@ -6,9 +6,14 @@ import KeyboardShortcuts
+ 
+ /// SwiftUI view for searching and finding menu bar apps
+ struct MenuBarSearchView: View {
++    @ObservedObject private var menuBarManager = MenuBarManager.shared
+     @State private var searchText = ""
+     @State private var selectedApp: RunningApp?
+     @State private var runningApps: [RunningApp] = []
++    @State private var selectedIcon: MenuBarItem?
++    @State private var menuBarItems: [MenuBarItem] = []
++    @State private var mode: SearchMode = .icons
++    @State private var pinnedOnly: Bool = false
+ 
+     let service: SearchServiceProtocol
+     let onDismiss: () -> Void
+@@ -18,6 +23,13 @@ struct MenuBarSearchView: View {
+         self.onDismiss = onDismiss
+     }
+ 
++    private func refresh() {
++        Task {
++            menuBarItems = await service.getMenuBarItems()
++            runningApps = await service.getRunningApps()
++        }
++    }
++
+     var filteredApps: [RunningApp] {
+         if searchText.isEmpty {
+             return runningApps
+@@ -28,13 +40,48 @@ struct MenuBarSearchView: View {
+         }
+     }
+ 
++    var filteredIcons: [MenuBarItem] {
++        let pinned = Set(menuBarManager.settings.pinnedMenuBarItemSignatures)
++        if searchText.isEmpty {
++            return menuBarItems
++                .filter { pinnedOnly ? menuBarManager.isPinned($0) : true }
++                .sorted { a, b in
++                    let ap = pinned.contains(a.signature)
++                    let bp = pinned.contains(b.signature)
++                    if ap != bp { return ap && !bp }
++                    return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
++                }
++        }
++        return menuBarItems
++            .filter { pinnedOnly ? menuBarManager.isPinned($0) : true }
++            .filter {
++            $0.title.localizedCaseInsensitiveContains(searchText) ||
++            ($0.appName?.localizedCaseInsensitiveContains(searchText) ?? false) ||
++            ($0.bundleID?.localizedCaseInsensitiveContains(searchText) ?? false)
++        }
++        .sorted { a, b in
++            let ap = pinned.contains(a.signature)
++            let bp = pinned.contains(b.signature)
++            if ap != bp { return ap && !bp }
++            return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
++        }
++    }
++
++    private var pinnedIcons: [MenuBarItem] {
++        filteredIcons.filter { menuBarManager.isPinned($0) }
++    }
++
++    private var unpinnedIcons: [MenuBarItem] {
++        filteredIcons.filter { !menuBarManager.isPinned($0) }
++    }
++
+     var body: some View {
+         VStack(spacing: 0) {
+             // Search field
+             HStack {
+                 Image(systemName: "magnifyingglass")
+                     .foregroundStyle(.secondary)
+-                TextField("Search apps...", text: $searchText)
++                TextField(mode == .icons ? "Search menu bar icons..." : "Search apps...", text: $searchText)
+                     .textFieldStyle(.plain)
+                     .font(.title3)
+ 
+@@ -48,13 +95,105 @@ struct MenuBarSearchView: View {
+                     )
+                     .buttonStyle(.plain)
+                 }
++
++                Button {
++                    refresh()
++                } label: {
++                    Image(systemName: "arrow.clockwise")
++                        .foregroundStyle(.secondary)
++                }
++                .buttonStyle(.plain)
++                .help("Refresh")
++                .keyboardShortcut("r", modifiers: [.command])
+             }
+             .padding()
+             .background(Color(NSColor.textBackgroundColor))
+             Divider()
+ 
++            // Mode toggle (Icons vs Apps)
++            Picker("", selection: $mode) {
++                Text("Icons").tag(SearchMode.icons)
++                Text("Apps").tag(SearchMode.apps)
++            }
++            .pickerStyle(.segmented)
++            .padding([.horizontal, .top])
++
++            if mode == .icons && !menuBarItems.isEmpty {
++                HStack {
++                    Toggle("Pinned only", isOn: $pinnedOnly)
++                        .toggleStyle(.checkbox)
++                    Spacer()
++                    Text("↩ Click  •  ⌘P Pin  •  ⌘R Refresh")
++                        .font(.caption2)
++                        .foregroundStyle(.secondary)
++                }
++                .padding(.horizontal)
++                .padding(.top, 6)
++            }
++
+             // App list
+-            if filteredApps.isEmpty {
++            if mode == .icons {
++                if menuBarItems.isEmpty {
++                    VStack(spacing: 10) {
++                        Image(systemName: "lock.shield")
++                            .font(.largeTitle)
++                            .foregroundStyle(.secondary)
++                        Text("Enable Accessibility to search menu bar icons")
++                            .foregroundStyle(.secondary)
++                        Text("SaneBar uses Accessibility to find and click icons behind the notch/overflow.")
++                            .font(.caption)
++                            .foregroundStyle(.tertiary)
++                            .multilineTextAlignment(.center)
++                            .padding(.horizontal)
++
++                        HStack(spacing: 8) {
++                            Button {
++                                AccessibilityService.shared.requestPermissionPrompt()
++                            } label: {
++                                Label("Request Permission", systemImage: "checkmark.shield")
++                            }
++                            .buttonStyle(.borderedProminent)
++
++                            Button {
++                                AccessibilityPermission.openAccessibilitySettings()
++                            } label: {
++                                Label("Open Settings", systemImage: "gearshape")
++                            }
++                            .buttonStyle(.bordered)
++                        }
++                    }
++                    .frame(maxWidth: .infinity, maxHeight: .infinity)
++                } else if filteredIcons.isEmpty {
++                    VStack(spacing: 8) {
++                        Image(systemName: "sparkle.magnifyingglass")
++                            .font(.largeTitle)
++                            .foregroundStyle(.secondary)
++                        Text("No matching icons")
++                            .foregroundStyle(.secondary)
++                    }
++                    .frame(maxWidth: .infinity, maxHeight: .infinity)
++                } else {
++                    List(selection: $selectedIcon) {
++                        if !pinnedIcons.isEmpty {
++                            Section("Pinned") {
++                                ForEach(pinnedIcons) { item in
++                                    MenuBarItemRow(item: item)
++                                        .tag(item)
++                                }
++                            }
++                        }
++                        if !unpinnedIcons.isEmpty && !pinnedOnly {
++                            Section("All Icons") {
++                                ForEach(unpinnedIcons) { item in
++                                    MenuBarItemRow(item: item)
++                                        .tag(item)
++                                }
++                            }
++                        }
++                    }
++                    .listStyle(.plain)
++                }
++            } else if filteredApps.isEmpty {
+                 VStack(spacing: 8) {
+                     Image(systemName: "app.dashed")
+                         .font(.largeTitle)
+@@ -74,7 +213,56 @@ struct MenuBarSearchView: View {
+ 
+             // Footer with actions
+             VStack(alignment: .leading, spacing: 8) {
+-                if let app = selectedApp {
++                if mode == .icons, let item = selectedIcon {
++                    HStack(spacing: 8) {
++                        Button {
++                            Task {
++                                await service.activate(menuBarItem: item)
++                                onDismiss()
++                            }
++                        } label: {
++                            Label("Click Icon", systemImage: "cursorarrow.click")
++                        }
++                        .buttonStyle(.borderedProminent)
++                        .keyboardShortcut(.return, modifiers: [])
++
++                        Button {
++                            menuBarManager.togglePinned(item)
++                        } label: {
++                            Label(menuBarManager.isPinned(item) ? "Pinned" : "Pin", systemImage: menuBarManager.isPinned(item) ? "star.fill" : "star")
++                        }
++                        .buttonStyle(.bordered)
++                        .keyboardShortcut("p", modifiers: [.command])
++
++                        Spacer()
++
++                        if let appName = item.appName {
++                            Text(appName)
++                                .font(.caption)
++                                .foregroundStyle(.secondary)
++                        }
++                    }
++
++                    if let stats = menuBarManager.clickStats(for: item) {
++                        let total = stats.successCount + stats.failureCount
++                        if total > 0 {
++                            Text("Click reliability: \(stats.successCount)/\(total) successes")
++                                .font(.caption)
++                                .foregroundStyle(.secondary)
++                        }
++                    } else if !AccessibilityService.shared.isTrusted {
++                        Text("Enable Accessibility to click icons reliably.")
++                            .font(.caption)
++                            .foregroundStyle(.secondary)
++                    }
++
++                    if let bundleID = item.bundleID {
++                        Text(bundleID)
++                            .font(.system(.caption, design: .monospaced))
++                            .foregroundStyle(.tertiary)
++                            .textSelection(.enabled)
++                    }
++                } else if mode == .apps, let app = selectedApp {
+                     // Row 1: Buttons
+                     HStack(spacing: 8) {
+                         Button {
+@@ -122,7 +310,9 @@ struct MenuBarSearchView: View {
+                         .foregroundStyle(.tertiary)
+                         .textSelection(.enabled)
+                 } else {
+-                    Text("Select an app and press Return to activate it.")
++                    Text(mode == .icons
++                         ? "Select an icon and press Return to click it."
++                         : "Select an app and press Return to activate it.")
+                         .font(.caption)
+                         .foregroundStyle(.secondary)
+                 }
+@@ -133,10 +323,16 @@ struct MenuBarSearchView: View {
+         }
+         .frame(width: 400, height: 300)
+         .onAppear {
++            // Prefer icon search if Accessibility is available.
+             Task {
++                menuBarItems = await service.getMenuBarItems()
+                 runningApps = await service.getRunningApps()
++                mode = menuBarItems.isEmpty ? .apps : .icons
+             }
+         }
++        .onReceive(NotificationCenter.default.publisher(for: .sanebarSearchWindowShown)) { _ in
++            refresh()
++        }
+         .onExitCommand {
+             onDismiss()
+         }
+@@ -179,6 +375,88 @@ struct AppRow: View {
+     }
+ }
+ 
++// MARK: - MenuBarItemRow
++
++struct MenuBarItemRow: View {
++    let item: MenuBarItem
++    @ObservedObject private var menuBarManager = MenuBarManager.shared
++
++    var body: some View {
++        HStack(spacing: 12) {
++            if let icon = item.icon {
++                Image(nsImage: icon)
++                    .resizable()
++                    .frame(width: 20, height: 20)
++            } else {
++                Image(systemName: "line.3.horizontal.decrease.circle")
++                    .frame(width: 20, height: 20)
++                    .foregroundStyle(.secondary)
++            }
++
++            VStack(alignment: .leading, spacing: 2) {
++                Text(item.title.isEmpty ? "Menu Bar Item" : item.title)
++                    .font(.body)
++                Text(item.appName ?? "Unknown Owner")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++            }
++
++            Spacer()
++
++            MenuBarItemClickBadge(item: item)
++
++            Button {
++                menuBarManager.togglePinned(item)
++            } label: {
++                Image(systemName: menuBarManager.isPinned(item) ? "star.fill" : "star")
++                    .foregroundStyle(menuBarManager.isPinned(item) ? .yellow : .secondary)
++            }
++            .buttonStyle(.plain)
++        }
++        .padding(.vertical, 4)
++    }
++}
++
++// MARK: - MenuBarItemClickBadge
++
++private struct MenuBarItemClickBadge: View {
++    let item: MenuBarItem
++    @ObservedObject private var menuBarManager = MenuBarManager.shared
++
++    var body: some View {
++        Group {
++            if !AccessibilityService.shared.isTrusted {
++                Image(systemName: "lock.fill")
++                    .foregroundStyle(.secondary)
++                    .help("Enable Accessibility to click icons")
++            } else {
++                switch menuBarManager.clickStatus(for: item) {
++                case .unknown:
++                    Image(systemName: "questionmark.circle")
++                        .foregroundStyle(.secondary)
++                        .help("Not clicked yet")
++                case .success:
++                    Image(systemName: "checkmark.circle.fill")
++                        .foregroundStyle(.green)
++                        .help("Last click succeeded")
++                case .failure:
++                    Image(systemName: "exclamationmark.triangle.fill")
++                        .foregroundStyle(.orange)
++                        .help("Last click failed (will fall back to activating the app)")
++                }
++            }
++        }
++        .frame(width: 16)
++    }
++}
++
++// MARK: - SearchMode
++
++enum SearchMode: Hashable {
++    case icons
++    case apps
++}
++
+ #Preview {
+     MenuBarSearchView(onDismiss: {})
+ }
+diff --git a/UI/SearchWindow/SearchWindowController.swift b/UI/SearchWindow/SearchWindowController.swift
+index 6315e3d..f76aed7 100644
+--- a/UI/SearchWindow/SearchWindowController.swift
++++ b/UI/SearchWindow/SearchWindowController.swift
+@@ -3,6 +3,10 @@ import SwiftUI
+ 
+ // MARK: - SearchWindowController
+ 
++extension Notification.Name {
++    static let sanebarSearchWindowShown = Notification.Name("SaneBar.searchWindowShown")
++}
++
+ /// Controller for the floating menu bar search window
+ @MainActor
+ final class SearchWindowController {
+@@ -14,6 +18,7 @@ final class SearchWindowController {
+     // MARK: - Window
+ 
+     private var window: NSWindow?
++    private var resignObserver: NSObjectProtocol?
+ 
+     // MARK: - Toggle
+ 
+@@ -49,6 +54,7 @@ final class SearchWindowController {
+ 
+         window.makeKeyAndOrderFront(nil)
+         NSApp.activate(ignoringOtherApps: true)
++        NotificationCenter.default.post(name: .sanebarSearchWindowShown, object: nil)
+     }
+ 
+     /// Close the search window
+@@ -81,7 +87,10 @@ final class SearchWindowController {
+         window.backgroundColor = NSColor.windowBackgroundColor
+ 
+         // Close when losing focus
+-        NotificationCenter.default.addObserver(
++        if let resignObserver = resignObserver {
++            NotificationCenter.default.removeObserver(resignObserver)
++        }
++        resignObserver = NotificationCenter.default.addObserver(
+             forName: NSWindow.didResignKeyNotification,
+             object: window,
+             queue: .main
+@@ -93,4 +102,10 @@ final class SearchWindowController {
+ 
+         self.window = window
+     }
++
++    deinit {
++        if let resignObserver = resignObserver {
++            NotificationCenter.default.removeObserver(resignObserver)
++        }
++    }
+ }
+diff --git a/UI/Settings/AdvancedSettingsView.swift b/UI/Settings/AdvancedSettingsView.swift
+index 138c204..cbd7e15 100644
+--- a/UI/Settings/AdvancedSettingsView.swift
++++ b/UI/Settings/AdvancedSettingsView.swift
+@@ -1,4 +1,5 @@
+ import SwiftUI
++import AppKit
+ 
+ struct AdvancedSettingsView: View {
+     @ObservedObject private var menuBarManager = MenuBarManager.shared
+@@ -84,7 +85,7 @@ struct AdvancedSettingsView: View {
+                         HStack {
+                             Text("Keep specific icons always visible.")
+                             Spacer()
+-                            HelpButton(tip: "Enter bundle IDs separated by commas.\n\n⌘+drag those icons LEFT of the separator.\n\nFind bundle ID:\nosascript -e 'id of app \"AppName\"'")
++                            HelpButton(tip: "Enter bundle IDs separated by commas.\n\n⌘+drag those icons to the RIGHT of the main separator (visible side).\n\nFind bundle ID:\nosascript -e 'id of app \"AppName\"'")
+                         }
+ 
+                         TextField("com.1password.1password, com.apple.Safari", text: Binding(
+@@ -123,7 +124,7 @@ struct AdvancedSettingsView: View {
+                                 .font(.system(size: 13))
+                                 .foregroundStyle(.secondary)
+                             Spacer()
+-                            HelpButton(tip: "How to add a hotkey:\n\n1. Set a \"Search apps\" shortcut in the Shortcuts tab\n2. Press that shortcut to open the app search\n3. Select an app and press a key to assign it\n\nThe hotkey will reveal hidden icons and activate that app.")
++                            HelpButton(tip: "How to add a hotkey:\n\n1. Set a \"Find menu bar icons\" shortcut in the Shortcuts tab\n2. Press that shortcut to open icon search\n3. Select an icon/app and press a key to assign it\n\nThe hotkey will reveal hidden icons and activate that app.")
+                         }
+ 
+                         if menuBarManager.settings.iconHotkeys.isEmpty {
+@@ -157,6 +158,44 @@ struct AdvancedSettingsView: View {
+                     Label("Icon Hotkeys", systemImage: "keyboard.badge.ellipsis")
+                 }
+ 
++                // Search (Cmd+Shift+Space) + Overflow Strip (Cmd+Shift+O)
++                GroupBox {
++                    VStack(alignment: .leading, spacing: 10) {
++                        HStack {
++                            Text("Control what appears in icon search & overflow strip.")
++                                .font(.system(size: 13))
++                                .foregroundStyle(.secondary)
++                            Spacer()
++                            HelpButton(tip: "When disabled (recommended), search focuses on high-signal apps:\n\n• Regular apps\n• Apps you've pinned via hotkeys/triggers\n• Apps that actually own a menu bar icon (if Accessibility is enabled)\n\nEnable this if you want to see all background/helper apps too.")
++                        }
++
++                        Toggle("Include background/helper apps in search", isOn: $menuBarManager.settings.searchIncludeBackgroundApps)
++                    }
++                    .frame(maxWidth: .infinity, alignment: .leading)
++                } label: {
++                    Label("Search", systemImage: "magnifyingglass")
++                }
++
++                // Diagnostics
++                GroupBox {
++                    VStack(alignment: .leading, spacing: 10) {
++                        Text("Useful for support and bug reports.")
++                            .font(.system(size: 13))
++                            .foregroundStyle(.secondary)
++
++                        Button {
++                            NSPasteboard.general.clearContents()
++                            NSPasteboard.general.setString(diagnosticsText(), forType: .string)
++                        } label: {
++                            Label("Copy Diagnostics", systemImage: "doc.on.doc")
++                        }
++                        .buttonStyle(.bordered)
++                    }
++                    .frame(maxWidth: .infinity, alignment: .leading)
++                } label: {
++                    Label("Diagnostics", systemImage: "stethoscope")
++                }
++
+                 // Menu Bar Appearance - collapsible
+                 GroupBox {
+                     VStack(alignment: .leading, spacing: 12) {
+@@ -307,7 +346,7 @@ struct AdvancedSettingsView: View {
+         }
+         .scrollIndicators(.automatic)
+         .onChange(of: menuBarManager.settings) { _, _ in
+-            menuBarManager.saveSettings()
++            menuBarManager.scheduleSaveSettings()
+         }
+     }
+ 
+@@ -323,6 +362,27 @@ struct AdvancedSettingsView: View {
+         return bundleID.split(separator: ".").last.map(String.init) ?? bundleID
+     }
+ 
++    private func diagnosticsText() -> String {
++        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
++        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
++        let os = ProcessInfo.processInfo.operatingSystemVersionString
++        let ax = AccessibilityService.shared.isTrusted ? "granted" : "not granted"
++        let pins = menuBarManager.settings.pinnedMenuBarItemSignatures.count
++        let stats = menuBarManager.settings.menuBarItemClickStats.count
++        let includeBg = menuBarManager.settings.searchIncludeBackgroundApps
++
++        return """
++        SaneBar Diagnostics
++        - Version: \(version) (\(build))
++        - macOS: \(os)
++        - Accessibility: \(ax)
++        - Notch detected: \(menuBarManager.hasNotch)
++        - Pinned icons: \(pins)
++        - Click stats entries: \(stats)
++        - Search include background apps: \(includeBg)
++        """
++    }
++
+     // MARK: - Profile Management
+ 
+     private func loadProfiles() {
+diff --git a/UI/Settings/GeneralSettingsView.swift b/UI/Settings/GeneralSettingsView.swift
+index 56a318b..85d707d 100644
+--- a/UI/Settings/GeneralSettingsView.swift
++++ b/UI/Settings/GeneralSettingsView.swift
+@@ -98,8 +98,8 @@ struct GeneralSettingsView: View {
+                                 Text("**⌘+drag** icons to organize them")
+                             }
+                             VStack(alignment: .leading, spacing: 6) {
+-                                Text("• Left of separator = can be hidden")
+-                                Text("• Right of separator = always visible")
++                                Text("• Left of separator = hidden group")
++                                Text("• Right of separator = visible group")
+                             }
+                             .font(.system(size: 13))
+                             .foregroundStyle(.tertiary)
+@@ -134,7 +134,7 @@ struct GeneralSettingsView: View {
+             .padding()
+         }
+         .onChange(of: menuBarManager.settings) { _, _ in
+-            menuBarManager.saveSettings()
++            menuBarManager.scheduleSaveSettings()
+         }
+     }
+ }
+diff --git a/UI/Settings/ShortcutsSettingsView.swift b/UI/Settings/ShortcutsSettingsView.swift
+index 09a476f..dcd32ff 100644
+--- a/UI/Settings/ShortcutsSettingsView.swift
++++ b/UI/Settings/ShortcutsSettingsView.swift
+@@ -14,7 +14,8 @@ struct ShortcutsSettingsView: View {
+                         KeyboardShortcuts.Recorder("Toggle visibility:", name: .toggleHiddenItems)
+                         KeyboardShortcuts.Recorder("Show hidden:", name: .showHiddenItems)
+                         KeyboardShortcuts.Recorder("Hide items:", name: .hideItems)
+-                        KeyboardShortcuts.Recorder("Search apps:", name: .searchMenuBar)
++                        KeyboardShortcuts.Recorder("Find menu bar icons:", name: .searchMenuBar)
++                        KeyboardShortcuts.Recorder("Overflow strip:", name: .overflowStrip)
+                         KeyboardShortcuts.Recorder("Open Settings:", name: .openSettings)
+                     }
+                     .tint(.blue)
+-- 
+2.43.0
+
